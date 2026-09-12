@@ -1,5 +1,6 @@
 from scheduler.job_store import JobStore
-
+from scheduler.job_state import JobStatus
+import threading
 
 def test_create_and_get_job(tmp_path):
     db_path = tmp_path / "scheduler.db"
@@ -89,3 +90,95 @@ def test_nested_json_payload(tmp_path):
     job = store.get_job(job_id)
 
     assert job["payload"] == payload
+
+def test_claim_job_moves_pending_to_running(tmp_path):
+    store = JobStore(tmp_path / "scheduler.db")
+
+    job_id = store.create_job(
+        "send_email",
+        {"user_id": 42},
+    )
+
+    job = store.claim_job()
+
+    assert job is not None
+    assert job["id"] == job_id
+    assert job["status"] == JobStatus.RUNNING
+
+    stored_job = store.get_job(job_id)
+
+    assert stored_job["status"] == JobStatus.RUNNING
+
+def test_claim_job_only_claims_pending_jobs(tmp_path):
+    store = JobStore(tmp_path / "scheduler.db")
+
+    job_id = store.create_job(
+        "send_email",
+        {"user_id": 42},
+    )
+
+    store.transition_job(
+        job_id,
+        JobStatus.RUNNING,
+    )
+
+    store.transition_job(
+        job_id,
+        JobStatus.SUCCESS,
+    )
+
+    claimed_job = store.claim_job()
+
+    assert claimed_job is None
+
+def test_claim_jobs_in_creation_order(tmp_path):
+    store = JobStore(tmp_path / "scheduler.db")
+
+    first_id = store.create_job(
+        "job_a",
+        {},
+    )
+
+    second_id = store.create_job(
+        "job_b",
+        {},
+    )
+
+    first = store.claim_job()
+    second = store.claim_job()
+
+    assert first["id"] == first_id
+    assert second["id"] == second_id
+
+def test_only_one_worker_can_claim_job(tmp_path):
+    store = JobStore(tmp_path / "scheduler.db")
+
+    job_id = store.create_job(
+        "send_email",
+        {"user_id": 42},
+    )
+
+    results = []
+
+    def claim():
+        worker_store = JobStore(tmp_path / "scheduler.db")
+        result = worker_store.claim_job()
+        results.append(result)
+
+    thread_a = threading.Thread(target=claim)
+    thread_b = threading.Thread(target=claim)
+
+    thread_a.start()
+    thread_b.start()
+
+    thread_a.join()
+    thread_b.join()
+
+    successful_claims = [
+        result
+        for result in results
+        if result is not None
+    ]
+
+    assert len(successful_claims) == 1
+    assert successful_claims[0]["id"] == job_id

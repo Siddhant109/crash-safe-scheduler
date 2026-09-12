@@ -21,9 +21,14 @@ class JobStore:
         self._initialize_database()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.db_path)
+        connection = sqlite3.connect(
+            self.db_path,
+            timeout=5.0,
+        )
 
         connection.row_factory = sqlite3.Row
+
+        connection.execute("PRAGMA journal_mode=WAL")
 
         return connection
 
@@ -168,3 +173,64 @@ class JobStore:
                     job_id,
                 ),
             )
+
+    def claim_job(self) -> dict | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id
+                FROM jobs
+                WHERE status = ?
+                ORDER BY created_at
+                LIMIT 1
+                """,
+                (JobStatus.PENDING.value,),
+            ).fetchone()
+
+            if row is None:
+                return None
+
+            job_id = row["id"]
+            now = datetime.now(timezone.utc).isoformat()
+
+            cursor = connection.execute(
+                """
+                UPDATE jobs
+                SET status = ?, updated_at = ?
+                WHERE id = ?
+                AND status = ?
+                """,
+                (
+                    JobStatus.RUNNING.value,
+                    now,
+                    job_id,
+                    JobStatus.PENDING.value,
+                ),
+            )
+
+            if cursor.rowcount != 1:
+                return None
+
+            claimed_row = connection.execute(
+                """
+                SELECT
+                    id,
+                    type,
+                    payload,
+                    status,
+                    created_at,
+                    updated_at
+                FROM jobs
+                WHERE id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+
+        return {
+            "id": claimed_row["id"],
+            "type": claimed_row["type"],
+            "payload": json.loads(claimed_row["payload"]),
+            "status": JobStatus(claimed_row["status"]),
+            "created_at": claimed_row["created_at"],
+            "updated_at": claimed_row["updated_at"],
+        }
