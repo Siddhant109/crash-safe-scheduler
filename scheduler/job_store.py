@@ -3,10 +3,20 @@ from pathlib import Path
 import json
 import uuid
 from datetime import datetime, timezone
+from scheduler.job_state import JobStatus, can_transition
 
 
 class JobStore:
-    def __init__(self, db_path: str | Path):
+    def __init__(
+        self,
+        db_path: str | Path | None = None,
+    ):
+        if db_path is None:
+            db_path = (
+                Path(__file__).resolve().parent.parent
+                / "scheduler.db"
+            )
+
         self.db_path = str(db_path)
         self._initialize_database()
 
@@ -53,7 +63,7 @@ class JobStore:
                     job_id,
                     job_type,
                     json.dumps(payload),
-                    "PENDING",
+                    JobStatus.PENDING.value,
                     now,
                     now,
                 ),
@@ -85,7 +95,7 @@ class JobStore:
             "id": row["id"],
             "type": row["type"],
             "payload": json.loads(row["payload"]),
-            "status": row["status"],
+            "status": JobStatus(row["status"]),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
@@ -117,3 +127,44 @@ class JobStore:
             }
             for row in rows
         ]
+
+    def transition_job(
+        self,
+        job_id: str,
+        target_status: JobStatus,
+    ) -> None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT status
+                FROM jobs
+                WHERE id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+
+            if row is None:
+                raise ValueError(f"Job not found: {job_id}")
+
+            current_status = JobStatus(row["status"])
+
+            if not can_transition(current_status, target_status):
+                raise ValueError(
+                    f"Invalid transition: "
+                    f"{current_status} -> {target_status}"
+                )
+
+            now = datetime.now(timezone.utc).isoformat()
+
+            connection.execute(
+                """
+                UPDATE jobs
+                SET status = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    target_status.value,
+                    now,
+                    job_id,
+                ),
+            )
