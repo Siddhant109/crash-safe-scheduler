@@ -4,6 +4,7 @@ import json
 import uuid
 from datetime import datetime, timezone
 from scheduler.job_state import JobStatus, can_transition
+from datetime import timedelta
 
 
 class JobStore:
@@ -41,13 +42,18 @@ class JobStore:
                     type TEXT NOT NULL,
                     payload TEXT NOT NULL,
                     status TEXT NOT NULL,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    max_attempts INTEGER NOT NULL DEFAULT 3,
+                    available_at TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
                 """
             )
 
-    def create_job(self, job_type: str, payload: dict) -> str:
+    def create_job(self, job_type: str, payload: dict, max_attempts: int = 3) -> str:
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be at least 1")
         job_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
 
@@ -59,16 +65,22 @@ class JobStore:
                     type,
                     payload,
                     status,
+                    attempt_count,
+                    max_attempts,
+                    available_at,
                     created_at,
                     updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
                     job_type,
                     json.dumps(payload),
                     JobStatus.PENDING.value,
+                    0,
+                    max_attempts,
+                    now,
                     now,
                     now,
                 ),
@@ -86,7 +98,10 @@ class JobStore:
                     payload,
                     status,
                     created_at,
-                    updated_at
+                    updated_at,
+                    attempt_count,
+                    max_attempts,
+                    available_at
                 FROM jobs
                 WHERE id = ?
                 """,
@@ -103,6 +118,9 @@ class JobStore:
             "status": JobStatus(row["status"]),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
+            "attempt_count": row["attempt_count"],
+            "max_attempts": row["max_attempts"],
+            "available_at": row["available_at"]
         }
 
     def list_jobs(self) -> list[dict]:
@@ -115,7 +133,10 @@ class JobStore:
                     payload,
                     status,
                     created_at,
-                    updated_at
+                    updated_at,
+                    attempt_count,
+                    max_attempts,
+                    available_at
                 FROM jobs
                 ORDER BY created_at
                 """
@@ -129,6 +150,9 @@ class JobStore:
                 "status": row["status"],
                 "created_at": row["created_at"],
                 "updated_at": row["updated_at"],
+                "attempt_count": row["attempt_count"],
+                "max_attempts": row["max_attempts"],
+                "available_at": row["available_at"]
             }
             for row in rows
         ]
@@ -181,10 +205,12 @@ class JobStore:
                 SELECT id
                 FROM jobs
                 WHERE status = ?
+                    AND available_at <= ?
                 ORDER BY created_at
                 LIMIT 1
                 """,
-                (JobStatus.PENDING.value,),
+                (JobStatus.PENDING.value,
+                 datetime.now(timezone.utc).isoformat()),
             ).fetchone()
 
             if row is None:
@@ -196,15 +222,20 @@ class JobStore:
             cursor = connection.execute(
                 """
                 UPDATE jobs
-                SET status = ?, updated_at = ?
+                SET
+                    status = ?,
+                    attempt_count = attempt_count + 1,
+                    updated_at = ?
                 WHERE id = ?
                 AND status = ?
+                AND available_at <= ?
                 """,
                 (
                     JobStatus.RUNNING.value,
                     now,
                     job_id,
                     JobStatus.PENDING.value,
+                    now
                 ),
             )
 
@@ -219,7 +250,10 @@ class JobStore:
                     payload,
                     status,
                     created_at,
-                    updated_at
+                    updated_at,
+                    attempt_count,
+                    max_attempts,
+                    available_at
                 FROM jobs
                 WHERE id = ?
                 """,
@@ -233,4 +267,102 @@ class JobStore:
             "status": JobStatus(claimed_row["status"]),
             "created_at": claimed_row["created_at"],
             "updated_at": claimed_row["updated_at"],
+            "attempt_count": claimed_row["attempt_count"],
+            "max_attempts": claimed_row["max_attempts"],
+            "available_at": claimed_row["available_at"]
         }
+
+    def retry_job(
+        self,
+        job_id: str,
+        delay_seconds: float,
+    ) -> None:
+        if delay_seconds < 0:
+            raise ValueError("delay_seconds cannot be negative")
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat()
+
+        available_at = (
+            now_dt + timedelta(seconds=delay_seconds)
+        ).isoformat()
+
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    status,
+                    attempt_count,
+                    max_attempts
+                FROM jobs
+                WHERE id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+
+            if row is None:
+                raise ValueError(f"Job not found: {job_id}")
+
+            if row["status"] != JobStatus.RUNNING.value:
+                raise ValueError(
+                    "Only RUNNING jobs can be retried"
+                )
+
+            if row["attempt_count"] >= row["max_attempts"]:
+                connection.execute(
+                    """
+                    UPDATE jobs
+                    SET
+                        status = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        JobStatus.FAILED.value,
+                        now,
+                        job_id,
+                    ),
+                )
+
+                return
+
+            connection.execute(
+                """
+                UPDATE jobs
+                SET
+                    status = ?,
+                    available_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                AND status = ?
+                """,
+                (
+                    JobStatus.RETRYING.value,
+                    available_at,
+                    now,
+                    job_id,
+                    JobStatus.RUNNING.value,
+                ),
+            )
+
+    def promote_due_retries(self) -> int:
+        now = datetime.now(timezone.utc).isoformat()
+
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE jobs
+                SET
+                    status = ?,
+                    updated_at = ?
+                WHERE status = ?
+                AND available_at <= ?
+                """,
+                (
+                    JobStatus.PENDING.value,
+                    now,
+                    JobStatus.RETRYING.value,
+                    now,
+                ),
+            )
+
+            return cursor.rowcount

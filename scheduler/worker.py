@@ -1,6 +1,8 @@
 import time
 
 from scheduler.job_store import JobStore
+from scheduler.job_state import JobStatus
+from scheduler.retry import calculate_backoff
 
 
 class Worker:
@@ -23,7 +25,29 @@ class Worker:
             f"Executing job {job['id']}"
         )
 
-        self.execute(job)
+        try:
+            self.execute(job)
+
+        except Exception as exc:
+            print(
+                f"[{self.worker_id}] "
+                f"Job {job['id']} failed: {exc}"
+            )
+
+            delay = calculate_backoff(
+                job["attempt_count"]
+            )
+
+            self.store.retry_job(
+                job["id"],
+                delay,
+            )
+
+        else:
+            self.store.transition_job(
+                job["id"],
+                JobStatus.SUCCESS,
+            )
 
         return True
 
