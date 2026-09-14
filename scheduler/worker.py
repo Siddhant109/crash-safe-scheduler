@@ -34,25 +34,37 @@ class Worker:
             self.execute(job)
 
         except Exception as exc:
-            print(
-                f"[{self.worker_id}] "
-                f"Job {job['id']} failed: {exc}"
-            )
-
             delay = calculate_backoff(
                 job["attempt_count"]
             )
 
-            self.store.retry_job(
-                job["id"],
-                delay,
+            retried = self.store.retry_job(
+                job_id=job["id"],
+                delay_seconds=delay,
+                worker_id=self.worker_id,
+                lease_generation=job["lease_generation"],
             )
 
+            if not retried:
+                print(
+                    f"[{self.worker_id}] "
+                    f"Could not retry job {job['id']}; "
+                    f"lease is no longer valid"
+                )
+
         else:
-            self.store.transition_job(
-                job["id"],
-                JobStatus.SUCCESS,
+            completed = self.store.complete_job(
+                job_id=job["id"],
+                worker_id=self.worker_id,
+                lease_generation=job["lease_generation"],
             )
+
+            if not completed:
+                print(
+                    f"[{self.worker_id}] "
+                    f"Could not complete job {job['id']}; "
+                    f"lease is no longer valid"
+                )
 
         return True
 

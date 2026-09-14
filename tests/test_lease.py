@@ -187,6 +187,8 @@ def test_retry_clears_lease(tmp_path):
     store.retry_job(
         job_id,
         delay_seconds=10,
+        worker_id="worker-1",
+        lease_generation=job["lease_generation"]
     )
 
     updated = store.get_job(job_id)

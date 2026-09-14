@@ -331,39 +331,49 @@ class JobStore:
         self,
         job_id: str,
         delay_seconds: float,
-    ) -> None:
+        worker_id: str,
+        lease_generation: int,
+    ) -> bool:
         if delay_seconds < 0:
             raise ValueError("delay_seconds cannot be negative")
-        now_dt = datetime.now(timezone.utc)
-        now = now_dt.isoformat()
 
+        if not worker_id:
+            raise ValueError("worker_id cannot be empty")
+
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
         available_at = (
-            now_dt + timedelta(seconds=delay_seconds)
+            now + timedelta(seconds=delay_seconds)
         ).isoformat()
 
         with self._connect() as connection:
             row = connection.execute(
                 """
                 SELECT
-                    status,
                     attempt_count,
                     max_attempts
                 FROM jobs
                 WHERE id = ?
+                AND status = ?
+                AND worker_id = ?
+                AND lease_generation = ?
+                AND lease_until IS NOT NULL
+                AND lease_until > ?
                 """,
-                (job_id,),
+                (
+                    job_id,
+                    JobStatus.RUNNING.value,
+                    worker_id,
+                    lease_generation,
+                    now_iso,
+                ),
             ).fetchone()
 
             if row is None:
-                raise ValueError(f"Job not found: {job_id}")
-
-            if row["status"] != JobStatus.RUNNING.value:
-                raise ValueError(
-                    "Only RUNNING jobs can be retried"
-                )
+                return False
 
             if row["attempt_count"] >= row["max_attempts"]:
-                connection.execute(
+                cursor = connection.execute(
                     """
                     UPDATE jobs
                     SET
@@ -372,17 +382,26 @@ class JobStore:
                         lease_until = NULL,
                         updated_at = ?
                     WHERE id = ?
+                    AND status = ?
+                    AND worker_id = ?
+                    AND lease_generation = ?
+                    AND lease_until IS NOT NULL
+                    AND lease_until > ?
                     """,
                     (
                         JobStatus.FAILED.value,
-                        now,
+                        now_iso,
                         job_id,
+                        JobStatus.RUNNING.value,
+                        worker_id,
+                        lease_generation,
+                        now_iso,
                     ),
                 )
 
-                return
+                return cursor.rowcount == 1
 
-            connection.execute(
+            cursor = connection.execute(
                 """
                 UPDATE jobs
                 SET
@@ -393,15 +412,24 @@ class JobStore:
                     updated_at = ?
                 WHERE id = ?
                 AND status = ?
+                AND worker_id = ?
+                AND lease_generation = ?
+                AND lease_until IS NOT NULL
+                AND lease_until > ?
                 """,
                 (
                     JobStatus.RETRYING.value,
                     available_at,
-                    now,
+                    now_iso,
                     job_id,
                     JobStatus.RUNNING.value,
+                    worker_id,
+                    lease_generation,
+                    now_iso,
                 ),
             )
+
+            return cursor.rowcount == 1
 
     def promote_due_retries(self) -> int:
         now = datetime.now(timezone.utc).isoformat()
@@ -487,3 +515,68 @@ class JobStore:
         now = datetime.now(timezone.utc)
 
         return lease_until <= now
+
+    def recover_expired_jobs(self) -> int:
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE jobs
+                SET
+                    status = ?,
+                    worker_id = NULL,
+                    lease_until = NULL,
+                    updated_at = ?
+                WHERE status = ?
+                AND lease_until IS NOT NULL
+                AND lease_until <= ?
+                """,
+                (
+                    JobStatus.PENDING.value,
+                    now_iso,
+                    JobStatus.RUNNING.value,
+                    now_iso,
+                ),
+            )
+
+            return cursor.rowcount
+
+    def complete_job(
+    self,
+    job_id: str,
+    worker_id: str,
+    lease_generation: int,
+) -> bool:
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE jobs
+                SET
+                    status = ?,
+                    worker_id = NULL,
+                    lease_until = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                AND status = ?
+                AND worker_id = ?
+                AND lease_generation = ?
+                AND lease_until IS NOT NULL
+                AND lease_until > ?
+                """,
+                (
+                    JobStatus.SUCCESS.value,
+                    now_iso,
+                    job_id,
+                    JobStatus.RUNNING.value,
+                    worker_id,
+                    lease_generation,
+                    now_iso,
+                ),
+            )
+
+            return cursor.rowcount == 1

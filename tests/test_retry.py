@@ -49,6 +49,8 @@ def test_failed_job_enters_retrying(tmp_path):
     store.retry_job(
         job_id,
         delay_seconds=10,
+        worker_id="worker-1",
+        lease_generation=job["lease_generation"]
     )
 
     retrying_job = store.get_job(job_id)
@@ -64,11 +66,13 @@ def test_retry_backoff_prevents_immediate_claim(tmp_path):
         {"user_id": 42},
     )
 
-    store.claim_job(worker_id="worker-1")
+    job = store.claim_job(worker_id="worker-1")
 
     store.retry_job(
         job_id,
         delay_seconds=60,
+        worker_id="worker-1",
+        lease_generation=job["lease_generation"]
     )
 
     claimed = store.claim_job(worker_id="worker-1")
@@ -83,11 +87,13 @@ def test_retry_with_zero_delay_becomes_claimable(tmp_path):
         {"user_id": 42},
     )
 
-    store.claim_job(worker_id="worker-1")
+    job = store.claim_job(worker_id="worker-1")
 
     store.retry_job(
         job_id,
         delay_seconds=0,
+        worker_id="worker-1",
+        lease_generation=job["lease_generation"]
     )
 
     store.transition_job(
@@ -116,6 +122,8 @@ def test_job_fails_after_max_attempts(tmp_path):
     store.retry_job(
         job_id,
         delay_seconds=0,
+        worker_id="worker-1",
+        lease_generation=first["lease_generation"]
     )
 
     store.transition_job(
@@ -130,6 +138,8 @@ def test_job_fails_after_max_attempts(tmp_path):
     store.retry_job(
         job_id,
         delay_seconds=0,
+        worker_id="worker-1",
+        lease_generation=second["lease_generation"]
     )
 
     job = store.get_job(job_id)
