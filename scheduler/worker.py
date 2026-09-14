@@ -10,12 +10,17 @@ class Worker:
         self,
         worker_id: str,
         store: JobStore,
+        lease_seconds: float = 30.0
     ):
         self.worker_id = worker_id
         self.store = store
+        self.lease_seconds = lease_seconds
 
     def run_once(self) -> bool:
-        job = self.store.claim_job()
+        job = self.store.claim_job(
+            worker_id=self.worker_id,
+            lease_seconds=self.lease_seconds,
+        )
 
         if job is None:
             return False

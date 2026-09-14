@@ -99,7 +99,7 @@ def test_claim_job_moves_pending_to_running(tmp_path):
         {"user_id": 42},
     )
 
-    job = store.claim_job()
+    job = store.claim_job(worker_id="worker-1")
 
     assert job is not None
     assert job["id"] == job_id
@@ -127,7 +127,7 @@ def test_claim_job_only_claims_pending_jobs(tmp_path):
         JobStatus.SUCCESS,
     )
 
-    claimed_job = store.claim_job()
+    claimed_job = store.claim_job(worker_id="worker-1")
 
     assert claimed_job is None
 
@@ -144,8 +144,8 @@ def test_claim_jobs_in_creation_order(tmp_path):
         {},
     )
 
-    first = store.claim_job()
-    second = store.claim_job()
+    first = store.claim_job(worker_id="worker-1")
+    second = store.claim_job(worker_id="worker-1")
 
     assert first["id"] == first_id
     assert second["id"] == second_id
@@ -162,7 +162,7 @@ def test_only_one_worker_can_claim_job(tmp_path):
 
     def claim():
         worker_store = JobStore(tmp_path / "scheduler.db")
-        result = worker_store.claim_job()
+        result = worker_store.claim_job(worker_id="worker-1")
         results.append(result)
 
     thread_a = threading.Thread(target=claim)

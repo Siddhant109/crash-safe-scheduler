@@ -29,7 +29,7 @@ def test_claim_increments_attempt_count(tmp_path):
         {"user_id": 42},
     )
 
-    job = store.claim_job()
+    job = store.claim_job(worker_id="worker-1")
 
     assert job["id"] == job_id
     assert job["attempt_count"] == 1
@@ -42,7 +42,7 @@ def test_failed_job_enters_retrying(tmp_path):
         {"user_id": 42},
     )
 
-    job = store.claim_job()
+    job = store.claim_job(worker_id="worker-1")
 
     assert job["attempt_count"] == 1
 
@@ -64,14 +64,14 @@ def test_retry_backoff_prevents_immediate_claim(tmp_path):
         {"user_id": 42},
     )
 
-    store.claim_job()
+    store.claim_job(worker_id="worker-1")
 
     store.retry_job(
         job_id,
         delay_seconds=60,
     )
 
-    claimed = store.claim_job()
+    claimed = store.claim_job(worker_id="worker-1")
 
     assert claimed is None
 
@@ -83,7 +83,7 @@ def test_retry_with_zero_delay_becomes_claimable(tmp_path):
         {"user_id": 42},
     )
 
-    store.claim_job()
+    store.claim_job(worker_id="worker-1")
 
     store.retry_job(
         job_id,
@@ -95,7 +95,7 @@ def test_retry_with_zero_delay_becomes_claimable(tmp_path):
         JobStatus.PENDING,
     )
 
-    job = store.claim_job()
+    job = store.claim_job(worker_id="worker-1")
 
     assert job["id"] == job_id
     assert job["attempt_count"] == 2
@@ -109,7 +109,7 @@ def test_job_fails_after_max_attempts(tmp_path):
         max_attempts=2,
     )
 
-    first = store.claim_job()
+    first = store.claim_job(worker_id="worker-1")
 
     assert first["attempt_count"] == 1
 
@@ -123,7 +123,7 @@ def test_job_fails_after_max_attempts(tmp_path):
         JobStatus.PENDING,
     )
 
-    second = store.claim_job()
+    second = store.claim_job(worker_id="worker-1")
 
     assert second["attempt_count"] == 2
 

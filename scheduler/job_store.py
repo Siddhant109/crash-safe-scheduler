@@ -2,10 +2,8 @@ import sqlite3
 from pathlib import Path
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from scheduler.job_state import JobStatus, can_transition
-from datetime import timedelta
-
 
 class JobStore:
     def __init__(
@@ -46,7 +44,10 @@ class JobStore:
                     max_attempts INTEGER NOT NULL DEFAULT 3,
                     available_at TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    worker_id TEXT,
+                    lease_until TEXT,
+                    lease_generation INTEGER NOT NULL DEFAULT 0
                 )
                 """
             )
@@ -101,7 +102,10 @@ class JobStore:
                     updated_at,
                     attempt_count,
                     max_attempts,
-                    available_at
+                    available_at,
+                    worker_id,
+                    lease_until,
+                    lease_generation
                 FROM jobs
                 WHERE id = ?
                 """,
@@ -120,7 +124,10 @@ class JobStore:
             "updated_at": row["updated_at"],
             "attempt_count": row["attempt_count"],
             "max_attempts": row["max_attempts"],
-            "available_at": row["available_at"]
+            "available_at": row["available_at"],
+            "worker_id": row["worker_id"],
+            "lease_until": row["lease_until"],
+            "lease_generation": row["lease_generation"]
         }
 
     def list_jobs(self) -> list[dict]:
@@ -136,7 +143,10 @@ class JobStore:
                     updated_at,
                     attempt_count,
                     max_attempts,
-                    available_at
+                    available_at,
+                    worker_id,
+                    lease_until,
+                    lease_generation
                 FROM jobs
                 ORDER BY created_at
                 """
@@ -152,7 +162,10 @@ class JobStore:
                 "updated_at": row["updated_at"],
                 "attempt_count": row["attempt_count"],
                 "max_attempts": row["max_attempts"],
-                "available_at": row["available_at"]
+                "available_at": row["available_at"],
+                "worker_id": row["worker_id"],
+                "lease_until": row["lease_until"],
+                "lease_generation": row["lease_generation"]
             }
             for row in rows
         ]
@@ -185,20 +198,52 @@ class JobStore:
 
             now = datetime.now(timezone.utc).isoformat()
 
-            connection.execute(
-                """
-                UPDATE jobs
-                SET status = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    target_status.value,
-                    now,
-                    job_id,
-                ),
-            )
+            if current_status == JobStatus.RUNNING:
+                connection.execute(
+                    """
+                    UPDATE jobs
+                    SET
+                        status = ?,
+                        worker_id = NULL,
+                        lease_until = NULL,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        target_status.value,
+                        now,
+                        job_id,
+                    ),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE jobs
+                    SET
+                        status = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        target_status.value,
+                        now,
+                        job_id,
+                    ),
+                )
 
-    def claim_job(self) -> dict | None:
+    def claim_job(self,  worker_id: str, lease_seconds: float = 30.0) -> dict | None:
+        if not worker_id:
+            raise ValueError("worker_id cannot be empty")
+
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be greater than 0")
+
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        lease_until = (
+            now + timedelta(seconds=lease_seconds)
+        ).isoformat()
+
         with self._connect() as connection:
             row = connection.execute(
                 """
@@ -210,14 +255,13 @@ class JobStore:
                 LIMIT 1
                 """,
                 (JobStatus.PENDING.value,
-                 datetime.now(timezone.utc).isoformat()),
+                 now_iso),
             ).fetchone()
 
             if row is None:
                 return None
 
             job_id = row["id"]
-            now = datetime.now(timezone.utc).isoformat()
 
             cursor = connection.execute(
                 """
@@ -225,6 +269,9 @@ class JobStore:
                 SET
                     status = ?,
                     attempt_count = attempt_count + 1,
+                    worker_id = ?,
+                    lease_until = ?,
+                    lease_generation = lease_generation + 1,
                     updated_at = ?
                 WHERE id = ?
                 AND status = ?
@@ -232,10 +279,12 @@ class JobStore:
                 """,
                 (
                     JobStatus.RUNNING.value,
-                    now,
+                    worker_id,
+                    lease_until,
+                    now_iso,
                     job_id,
                     JobStatus.PENDING.value,
-                    now
+                    now_iso
                 ),
             )
 
@@ -253,7 +302,10 @@ class JobStore:
                     updated_at,
                     attempt_count,
                     max_attempts,
-                    available_at
+                    available_at,
+                    worker_id,
+                    lease_until,
+                    lease_generation
                 FROM jobs
                 WHERE id = ?
                 """,
@@ -269,7 +321,10 @@ class JobStore:
             "updated_at": claimed_row["updated_at"],
             "attempt_count": claimed_row["attempt_count"],
             "max_attempts": claimed_row["max_attempts"],
-            "available_at": claimed_row["available_at"]
+            "available_at": claimed_row["available_at"],
+            "worker_id": claimed_row["worker_id"],
+            "lease_until": claimed_row["lease_until"],
+            "lease_generation": claimed_row["lease_generation"]
         }
 
     def retry_job(
@@ -313,6 +368,8 @@ class JobStore:
                     UPDATE jobs
                     SET
                         status = ?,
+                        worker_id = NULL,
+                        lease_until = NULL,
                         updated_at = ?
                     WHERE id = ?
                     """,
@@ -331,6 +388,8 @@ class JobStore:
                 SET
                     status = ?,
                     available_at = ?,
+                    worker_id = NULL,
+                    lease_until = NULL,
                     updated_at = ?
                 WHERE id = ?
                 AND status = ?
@@ -366,3 +425,65 @@ class JobStore:
             )
 
             return cursor.rowcount
+
+    def heartbeat(
+        self,
+        job_id: str,
+        worker_id: str,
+        lease_generation: int,
+        lease_seconds: float = 30.0,
+    ) -> bool:
+        if not worker_id:
+            raise ValueError("worker_id cannot be empty")
+
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be greater than 0")
+
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        new_lease_until = (
+            now + timedelta(seconds=lease_seconds)
+        ).isoformat()
+
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE jobs
+                SET
+                    lease_until = ?,
+                    updated_at = ?
+                WHERE id = ?
+                AND status = ?
+                AND worker_id = ?
+                AND lease_generation = ?
+                AND lease_until > ?
+                """,
+                (
+                    new_lease_until,
+                    now_iso,
+                    job_id,
+                    JobStatus.RUNNING.value,
+                    worker_id,
+                    lease_generation,
+                    now_iso,
+                ),
+            )
+
+            return cursor.rowcount == 1
+
+    def is_lease_expired(self, job_id: str) -> bool:
+        job = self.get_job(job_id)
+
+        if job is None:
+            raise ValueError(f"Job not found: {job_id}")
+
+        if job["status"] != JobStatus.RUNNING:
+            return False
+
+        if job["lease_until"] is None:
+            return True
+
+        lease_until = datetime.fromisoformat(job["lease_until"])
+        now = datetime.now(timezone.utc)
+
+        return lease_until <= now
