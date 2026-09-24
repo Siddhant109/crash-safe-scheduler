@@ -137,12 +137,12 @@ def test_expired_lease_is_detected(tmp_path):
 
     store.claim_job(
         worker_id="worker-1",
-        lease_seconds=0.05,
+        lease_seconds=0.5,
     )
 
     assert store.is_lease_expired(job_id) is False
 
-    time.sleep(0.1)
+    time.sleep(0.6)
 
     assert store.is_lease_expired(job_id) is True
 

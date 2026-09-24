@@ -52,6 +52,36 @@ class JobStore:
                 """
             )
 
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS job_executions (
+                    id TEXT PRIMARY KEY,
+                    job_id TEXT NOT NULL,
+                    attempt_number INTEGER NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    worker_id TEXT NOT NULL,
+                    lease_generation INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+
+                    FOREIGN KEY (job_id) REFERENCES jobs(id),
+
+                    UNIQUE(job_id, attempt_number)
+                )
+                """
+            )
+
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS idempotency_records (
+                    idempotency_key TEXT PRIMARY KEY,
+                    result TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+
     def create_job(self, job_type: str, payload: dict, max_attempts: int = 3) -> str:
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
@@ -544,39 +574,242 @@ class JobStore:
             return cursor.rowcount
 
     def complete_job(
-    self,
-    job_id: str,
-    worker_id: str,
-    lease_generation: int,
-) -> bool:
+        self,
+        job_id: str,
+        worker_id: str,
+        lease_generation: int,
+    ) -> bool:
+            now = datetime.now(timezone.utc)
+            now_iso = now.isoformat()
+
+            with self._connect() as connection:
+                cursor = connection.execute(
+                    """
+                    UPDATE jobs
+                    SET
+                        status = ?,
+                        worker_id = NULL,
+                        lease_until = NULL,
+                        updated_at = ?
+                    WHERE id = ?
+                    AND status = ?
+                    AND worker_id = ?
+                    AND lease_generation = ?
+                    AND lease_until IS NOT NULL
+                    AND lease_until > ?
+                    """,
+                    (
+                        JobStatus.SUCCESS.value,
+                        now_iso,
+                        job_id,
+                        JobStatus.RUNNING.value,
+                        worker_id,
+                        lease_generation,
+                        now_iso,
+                    ),
+                )
+
+                return cursor.rowcount == 1
+
+    def create_execution(
+        self,
+        job: dict,
+        worker_id: str,
+    ) -> dict:
         now = datetime.now(timezone.utc)
         now_iso = now.isoformat()
 
+        execution_id = str(uuid.uuid4())
+
+        attempt_number = job["attempt_count"]
+        idempotency_key = job["id"]
+
         with self._connect() as connection:
-            cursor = connection.execute(
+            connection.execute(
                 """
-                UPDATE jobs
-                SET
-                    status = ?,
-                    worker_id = NULL,
-                    lease_until = NULL,
-                    updated_at = ?
-                WHERE id = ?
-                AND status = ?
-                AND worker_id = ?
-                AND lease_generation = ?
-                AND lease_until IS NOT NULL
-                AND lease_until > ?
-                """,
-                (
-                    JobStatus.SUCCESS.value,
-                    now_iso,
+                INSERT INTO job_executions (
+                    id,
                     job_id,
-                    JobStatus.RUNNING.value,
+                    attempt_number,
+                    idempotency_key,
                     worker_id,
                     lease_generation,
+                    status,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    execution_id,
+                    job["id"],
+                    attempt_number,
+                    idempotency_key,
+                    worker_id,
+                    job["lease_generation"],
+                    "STARTED",
+                    now_iso,
                     now_iso,
                 ),
             )
 
-            return cursor.rowcount == 1
+        return {
+            "id": execution_id,
+            "job_id": job["id"],
+            "attempt_number": attempt_number,
+            "idempotency_key": idempotency_key,
+            "worker_id": worker_id,
+            "lease_generation": job["lease_generation"],
+            "status": "STARTED",
+            "created_at": now_iso,
+            "updated_at": now_iso,
+        }
+
+    def update_execution(
+        self,
+        execution_id: str,
+        status: str,
+    ) -> None:
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE job_executions
+                SET
+                    status = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    status,
+                    now_iso,
+                    execution_id,
+                ),
+            )
+
+            if cursor.rowcount != 1:
+                raise ValueError(
+                    f"Execution not found: {execution_id}"
+                )
+
+    def get_execution(
+        self,
+        execution_id: str,
+    ) -> dict | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    id,
+                    job_id,
+                    attempt_number,
+                    idempotency_key,
+                    worker_id,
+                    lease_generation,
+                    status,
+                    created_at,
+                    updated_at
+                FROM job_executions
+                WHERE id = ?
+                """,
+                (execution_id,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        return dict(row)
+
+    def list_executions(
+        self,
+        job_id: str,
+    ) -> list[dict]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    id,
+                    job_id,
+                    attempt_number,
+                    idempotency_key,
+                    worker_id,
+                    lease_generation,
+                    status,
+                    created_at,
+                    updated_at
+                FROM job_executions
+                WHERE job_id = ?
+                ORDER BY attempt_number
+                """,
+                (job_id,),
+            ).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def execute_idempotent_side_effect(
+        self,
+        idempotency_key: str,
+        job: dict,
+    ) -> dict:
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        with self._connect() as connection:
+            existing = connection.execute(
+                """
+                SELECT
+                    result
+                FROM idempotency_records
+                WHERE idempotency_key = ?
+                """,
+                (idempotency_key,),
+            ).fetchone()
+
+            if existing is not None:
+                return {
+                    "result": json.loads(existing["result"]),
+                    "duplicate": True,
+                }
+
+            result = {
+                "job_id": job["id"],
+                "job_type": job["type"],
+                "message": "side effect executed",
+            }
+
+            connection.execute(
+                """
+                INSERT INTO idempotency_records (
+                    idempotency_key,
+                    result,
+                    created_at
+                )
+                VALUES (?, ?, ?)
+                """,
+                (
+                    idempotency_key,
+                    json.dumps(result),
+                    now_iso,
+                ),
+            )
+
+            return {
+                "result": result,
+                "duplicate": False,
+            }
+
+    def count_idempotency_records(
+        self,
+        idempotency_key: str,
+    ) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM idempotency_records
+                WHERE idempotency_key = ?
+                """,
+                (idempotency_key,),
+            ).fetchone()
+
+        return row["count"]
