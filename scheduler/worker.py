@@ -5,6 +5,7 @@ from scheduler.job_state import JobStatus
 from scheduler.retry import calculate_backoff
 from .execution import IdempotentExecutor
 from scheduler.worker_state import WorkerState
+from scheduler.job_history import JobEventType
 
 class Worker:
     def __init__(
@@ -45,6 +46,14 @@ class Worker:
                 worker_id=self.worker_id,
             )
 
+            self.store.record_event(
+                job_id=job["id"],
+                event_type=JobEventType.EXECUTION_STARTED,
+                worker_id=self.worker_id,
+                lease_generation=job["lease_generation"],
+                attempt_number=job["attempt_count"],
+            )
+
             print(
                 f"[{self.worker_id}] "
                 f"Executing job {job['id']} "
@@ -57,7 +66,19 @@ class Worker:
                     idempotency_key=execution["idempotency_key"],
                 )
 
-            except Exception:
+            except Exception as exc:
+                self.store.record_event(
+                    job_id=job["id"],
+                    event_type=JobEventType.EXECUTION_FAILED,
+                    worker_id=self.worker_id,
+                    lease_generation=job["lease_generation"],
+                    attempt_number=job["attempt_count"],
+                    details={
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    },
+                )
+
                 self.store.update_execution(
                     execution_id=execution["id"],
                     status="FAILED",
@@ -75,6 +96,14 @@ class Worker:
                 )
 
             else:
+                self.store.record_event(
+                    job_id=job["id"],
+                    event_type=JobEventType.EXECUTION_SUCCEEDED,
+                    worker_id=self.worker_id,
+                    lease_generation=job["lease_generation"],
+                    attempt_number=job["attempt_count"],
+                )
+
                 self.store.update_execution(
                     execution_id=execution["id"],
                     status="SUCCEEDED",
@@ -84,6 +113,14 @@ class Worker:
                     job_id=job["id"],
                     worker_id=self.worker_id,
                     lease_generation=job["lease_generation"],
+                )
+
+                self.store.record_event(
+                    job_id=job["id"],
+                    event_type=JobEventType.COMPLETED,
+                    worker_id=self.worker_id,
+                    lease_generation=job["lease_generation"],
+                    attempt_number=job["attempt_count"],
                 )
 
                 if not completed:

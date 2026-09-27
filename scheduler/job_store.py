@@ -5,6 +5,7 @@ import uuid
 from datetime import datetime, timezone, timedelta
 from scheduler.job_state import JobStatus, can_transition
 from .job_priority import JobPriority
+from .job_history import JobEventType
 
 class JobStore:
     def __init__(
@@ -84,6 +85,22 @@ class JobStore:
                 """
             )
 
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS job_history (
+                    id TEXT PRIMARY KEY,
+                    job_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    worker_id TEXT,
+                    lease_generation INTEGER,
+                    attempt_number INTEGER,
+                    details TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (job_id) REFERENCES jobs(id)
+                )
+                """
+            )
+
     def create_job(self, job_type: str, payload: dict, max_attempts: int = 3, priority: JobPriority = JobPriority.NORMAL) -> str:
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
@@ -122,6 +139,32 @@ class JobStore:
                     now,
                     now,
                     priority.value
+                ),
+            )
+
+            connection.execute(
+                """
+                INSERT INTO job_history (
+                    id,
+                    job_id,
+                    event_type,
+                    worker_id,
+                    lease_generation,
+                    attempt_number,
+                    details,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    job_id,
+                    JobEventType.CREATED.value,
+                    None,
+                    None,
+                    0,
+                    None,
+                    now,
                 ),
             )
 
@@ -379,6 +422,32 @@ class JobStore:
                 (job_id,),
             ).fetchone()
 
+            connection.execute(
+                """
+                INSERT INTO job_history (
+                id,
+                job_id,
+                event_type,
+                worker_id,
+                lease_generation,
+                attempt_number,
+                details,
+                created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    job_id,
+                    JobEventType.CLAIMED.value,
+                    worker_id,
+                    claimed_row["lease_generation"],
+                    claimed_row["attempt_count"],
+                    None,
+                    now_iso,
+                ),
+            )
+
         return {
             "id": claimed_row["id"],
             "type": claimed_row["type"],
@@ -440,6 +509,8 @@ class JobStore:
             if row is None:
                 return False
 
+            attempt_number = row["attempt_count"]
+
             if row["attempt_count"] >= row["max_attempts"]:
                 cursor = connection.execute(
                     """
@@ -493,6 +564,34 @@ class JobStore:
                     JobStatus.RUNNING.value,
                     worker_id,
                     lease_generation,
+                    now_iso,
+                ),
+            )
+
+            connection.execute(
+                """
+                INSERT INTO job_history (
+                    id,
+                    job_id,
+                    event_type,
+                    worker_id,
+                    lease_generation,
+                    attempt_number,
+                    details,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    job_id,
+                    JobEventType.RETRY_SCHEDULED.value,
+                    worker_id,
+                    lease_generation,
+                    attempt_number,
+                    json.dumps({
+                        "delay_seconds": delay_seconds,
+                    }),
                     now_iso,
                 ),
             )
@@ -589,6 +688,24 @@ class JobStore:
         now_iso = now.isoformat()
 
         with self._connect() as connection:
+            rows = connection.execute(
+                        """
+                        SELECT
+                            id,
+                            worker_id,
+                            lease_generation,
+                            attempt_count
+                        FROM jobs
+                        WHERE status = ?
+                        AND lease_until IS NOT NULL
+                        AND lease_until <= ?
+                        """,
+                        (
+                            JobStatus.RUNNING.value,
+                            now_iso,
+                        ),
+                    ).fetchall()
+            
             cursor = connection.execute(
                 """
                 UPDATE jobs
@@ -608,6 +725,35 @@ class JobStore:
                     now_iso,
                 ),
             )
+
+            for row in rows:
+                connection.execute(
+                    """
+                    INSERT INTO job_history (
+                        id,
+                        job_id,
+                        event_type,
+                        worker_id,
+                        lease_generation,
+                        attempt_number,
+                        details,
+                        created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        row["id"],
+                        JobEventType.RECOVERED.value,
+                        row["worker_id"],
+                        row["lease_generation"],
+                        row["attempt_count"],
+                        json.dumps({
+                            "reason": "lease_expired",
+                        }),
+                        now_iso,
+                    ),
+                )
 
             return cursor.rowcount
 
@@ -851,3 +997,82 @@ class JobStore:
             ).fetchone()
 
         return row["count"]
+
+    def record_event(
+        self,
+        job_id: str,
+        event_type: JobEventType,
+        worker_id: str | None = None,
+        lease_generation: int | None = None,
+        attempt_number: int | None = None,
+        details: dict | None = None,
+    ) -> str:
+        event_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc).isoformat()
+
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO job_history (
+                    id,
+                    job_id,
+                    event_type,
+                    worker_id,
+                    lease_generation,
+                    attempt_number,
+                    details,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    job_id,
+                    event_type.value,
+                    worker_id,
+                    lease_generation,
+                    attempt_number,
+                    json.dumps(details) if details is not None else None,
+                    now,
+                ),
+            )
+
+        return event_id
+
+    def get_job_history(self, job_id: str) -> list[dict]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    id,
+                    job_id,
+                    event_type,
+                    worker_id,
+                    lease_generation,
+                    attempt_number,
+                    details,
+                    created_at
+                FROM job_history
+                WHERE job_id = ?
+                ORDER BY created_at ASC, id ASC
+                """,
+                (job_id,),
+            ).fetchall()
+
+        return [
+            {
+                "id": row["id"],
+                "job_id": row["job_id"],
+                "event_type": JobEventType(row["event_type"]),
+                "worker_id": row["worker_id"],
+                "lease_generation": row["lease_generation"],
+                "attempt_number": row["attempt_number"],
+                "details": (
+                    json.loads(row["details"])
+                    if row["details"] is not None
+                    else None
+                ),
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
