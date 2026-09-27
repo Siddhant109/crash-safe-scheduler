@@ -4,7 +4,7 @@ from scheduler.job_store import JobStore
 from scheduler.job_state import JobStatus
 from scheduler.retry import calculate_backoff
 from .execution import IdempotentExecutor
-
+from scheduler.worker_state import WorkerState
 
 class Worker:
     def __init__(
@@ -24,8 +24,12 @@ class Worker:
         )
 
         self.max_concurrent_jobs = max_concurrent_jobs
+        self.state = WorkerState.RUNNING
 
     def run_once(self) -> bool:
+        if self.state != WorkerState.RUNNING:
+            return False
+        
         job = self.store.claim_job(
             worker_id=self.worker_id,
             lease_seconds=self.lease_seconds,
@@ -34,59 +38,64 @@ class Worker:
 
         if job is None:
             return False
-
-        execution = self.store.create_execution(
-            job=job,
-            worker_id=self.worker_id,
-        )
-
-        print(
-            f"[{self.worker_id}] "
-            f"Executing job {job['id']} "
-            f"(attempt={job['attempt_count']})"
-        )
-
+        
         try:
-            self.executor.execute(
+            execution = self.store.create_execution(
                 job=job,
-                idempotency_key=execution["idempotency_key"],
-            )
-
-        except Exception:
-            self.store.update_execution(
-                execution_id=execution["id"],
-                status="FAILED",
-            )
-
-            delay = calculate_backoff(
-                job["attempt_count"]
-            )
-
-            self.store.retry_job(
-                job_id=job["id"],
-                delay_seconds=delay,
                 worker_id=self.worker_id,
-                lease_generation=job["lease_generation"],
             )
 
-        else:
-            self.store.update_execution(
-                execution_id=execution["id"],
-                status="SUCCEEDED",
+            print(
+                f"[{self.worker_id}] "
+                f"Executing job {job['id']} "
+                f"(attempt={job['attempt_count']})"
             )
 
-            completed = self.store.complete_job(
-                job_id=job["id"],
-                worker_id=self.worker_id,
-                lease_generation=job["lease_generation"],
-            )
-
-            if not completed:
-                print(
-                    f"[{self.worker_id}] "
-                    f"Could not complete job {job['id']}; "
-                    f"lease is no longer valid"
+            try:
+                self.executor.execute(
+                    job=job,
+                    idempotency_key=execution["idempotency_key"],
                 )
+
+            except Exception:
+                self.store.update_execution(
+                    execution_id=execution["id"],
+                    status="FAILED",
+                )
+
+                delay = calculate_backoff(
+                    job["attempt_count"]
+                )
+
+                self.store.retry_job(
+                    job_id=job["id"],
+                    delay_seconds=delay,
+                    worker_id=self.worker_id,
+                    lease_generation=job["lease_generation"],
+                )
+
+            else:
+                self.store.update_execution(
+                    execution_id=execution["id"],
+                    status="SUCCEEDED",
+                )
+
+                completed = self.store.complete_job(
+                    job_id=job["id"],
+                    worker_id=self.worker_id,
+                    lease_generation=job["lease_generation"],
+                )
+
+                if not completed:
+                    print(
+                        f"[{self.worker_id}] "
+                        f"Could not complete job {job['id']}; "
+                        f"lease is no longer valid"
+                    )
+
+        finally:
+            if self.state == WorkerState.STOPPING:
+                self.state = WorkerState.STOPPED
 
         return True
 
@@ -95,3 +104,9 @@ class Worker:
             f"[{self.worker_id}] "
             f"Job {job['id']} completed"
         )
+
+    def shutdown(self) -> None:
+        if self.state == WorkerState.STOPPED:
+            return
+
+        self.state = WorkerState.STOPPING
