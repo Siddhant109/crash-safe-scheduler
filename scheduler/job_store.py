@@ -4,6 +4,7 @@ import json
 import uuid
 from datetime import datetime, timezone, timedelta
 from scheduler.job_state import JobStatus, can_transition
+from .job_priority import JobPriority
 
 class JobStore:
     def __init__(
@@ -47,7 +48,8 @@ class JobStore:
                     updated_at TEXT NOT NULL,
                     worker_id TEXT,
                     lease_until TEXT,
-                    lease_generation INTEGER NOT NULL DEFAULT 0
+                    lease_generation INTEGER NOT NULL DEFAULT 0,
+                    priority INTEGER NOT NULL DEFAULT 2
                 )
                 """
             )
@@ -82,9 +84,13 @@ class JobStore:
                 """
             )
 
-    def create_job(self, job_type: str, payload: dict, max_attempts: int = 3) -> str:
+    def create_job(self, job_type: str, payload: dict, max_attempts: int = 3, priority: JobPriority = JobPriority.NORMAL) -> str:
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
+        if not isinstance(priority, JobPriority):
+            raise ValueError(
+                "priority must be a JobPriority"
+            )
         job_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
 
@@ -100,9 +106,10 @@ class JobStore:
                     max_attempts,
                     available_at,
                     created_at,
-                    updated_at
+                    updated_at,
+                    priority
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -114,6 +121,7 @@ class JobStore:
                     now,
                     now,
                     now,
+                    priority.value
                 ),
             )
 
@@ -135,7 +143,8 @@ class JobStore:
                     available_at,
                     worker_id,
                     lease_until,
-                    lease_generation
+                    lease_generation,
+                    priority
                 FROM jobs
                 WHERE id = ?
                 """,
@@ -157,7 +166,8 @@ class JobStore:
             "available_at": row["available_at"],
             "worker_id": row["worker_id"],
             "lease_until": row["lease_until"],
-            "lease_generation": row["lease_generation"]
+            "lease_generation": row["lease_generation"],
+            "priority": JobPriority(row["priority"])
         }
 
     def list_jobs(self) -> list[dict]:
@@ -176,7 +186,8 @@ class JobStore:
                     available_at,
                     worker_id,
                     lease_until,
-                    lease_generation
+                    lease_generation,
+                    priority
                 FROM jobs
                 ORDER BY created_at
                 """
@@ -195,7 +206,8 @@ class JobStore:
                 "available_at": row["available_at"],
                 "worker_id": row["worker_id"],
                 "lease_until": row["lease_until"],
-                "lease_generation": row["lease_generation"]
+                "lease_generation": row["lease_generation"],
+                "priority": JobPriority(row["priority"])
             }
             for row in rows
         ]
@@ -261,12 +273,18 @@ class JobStore:
                     ),
                 )
 
-    def claim_job(self,  worker_id: str, lease_seconds: float = 30.0) -> dict | None:
+    def claim_job(self,  worker_id: str, lease_seconds: float = 30.0, max_concurrent_jobs: int | None = None) -> dict | None:
         if not worker_id:
             raise ValueError("worker_id cannot be empty")
 
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be greater than 0")
+
+        if max_concurrent_jobs is not None:
+            if max_concurrent_jobs < 1:
+                raise ValueError(
+                    "max_concurrent_jobs must be at least 1"
+                )
 
         now = datetime.now(timezone.utc)
         now_iso = now.isoformat()
@@ -275,13 +293,29 @@ class JobStore:
         ).isoformat()
 
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+
+            if max_concurrent_jobs is not None:
+                running_row = connection.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM jobs
+                    WHERE status = ?
+                    """,
+                    (JobStatus.RUNNING.value,),
+                ).fetchone()
+
+                if running_row["count"] >= max_concurrent_jobs:
+                    connection.rollback()
+                    return None
+
             row = connection.execute(
                 """
                 SELECT id
                 FROM jobs
                 WHERE status = ?
                     AND available_at <= ?
-                ORDER BY created_at
+                ORDER BY priority DESC, created_at ASC
                 LIMIT 1
                 """,
                 (JobStatus.PENDING.value,
@@ -289,6 +323,7 @@ class JobStore:
             ).fetchone()
 
             if row is None:
+                connection.rollback()
                 return None
 
             job_id = row["id"]
@@ -319,6 +354,7 @@ class JobStore:
             )
 
             if cursor.rowcount != 1:
+                connection.rollback()
                 return None
 
             claimed_row = connection.execute(
@@ -335,7 +371,8 @@ class JobStore:
                     available_at,
                     worker_id,
                     lease_until,
-                    lease_generation
+                    lease_generation,
+                    priority
                 FROM jobs
                 WHERE id = ?
                 """,
@@ -354,7 +391,8 @@ class JobStore:
             "available_at": claimed_row["available_at"],
             "worker_id": claimed_row["worker_id"],
             "lease_until": claimed_row["lease_until"],
-            "lease_generation": claimed_row["lease_generation"]
+            "lease_generation": claimed_row["lease_generation"],
+            "priority": JobPriority(claimed_row["priority"])
         }
 
     def retry_job(

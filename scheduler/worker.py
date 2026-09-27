@@ -13,6 +13,7 @@ class Worker:
         store: JobStore,
         lease_seconds: float = 30.0,
         executor=None,
+        max_concurrent_jobs: int | None = None
     ):
         self.worker_id = worker_id
         self.store = store
@@ -22,10 +23,13 @@ class Worker:
             store
         )
 
+        self.max_concurrent_jobs = max_concurrent_jobs
+
     def run_once(self) -> bool:
         job = self.store.claim_job(
             worker_id=self.worker_id,
             lease_seconds=self.lease_seconds,
+            max_concurrent_jobs=self.max_concurrent_jobs
         )
 
         if job is None:
