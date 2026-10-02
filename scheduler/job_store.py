@@ -936,34 +936,22 @@ class JobStore:
         idempotency_key: str,
         job: dict,
     ) -> dict:
-        now_iso = datetime.now(timezone.utc).isoformat()
+        if not idempotency_key:
+            raise ValueError("idempotency_key cannot be empty")
+
+        now = datetime.now(timezone.utc).isoformat()
+
+        result = {
+            "job_id": job["id"],
+            "status": "completed",
+        }
+
+        result_json = json.dumps(result)
 
         with self._connect() as connection:
-            existing = connection.execute(
+            cursor = connection.execute(
                 """
-                SELECT
-                    result
-                FROM idempotency_records
-                WHERE idempotency_key = ?
-                """,
-                (idempotency_key,),
-            ).fetchone()
-
-            if existing is not None:
-                return {
-                    "result": json.loads(existing["result"]),
-                    "duplicate": True,
-                }
-
-            result = {
-                "job_id": job["id"],
-                "job_type": job["type"],
-                "message": "side effect executed",
-            }
-
-            connection.execute(
-                """
-                INSERT INTO idempotency_records (
+                INSERT OR IGNORE INTO idempotency_records (
                     idempotency_key,
                     result,
                     created_at
@@ -972,14 +960,29 @@ class JobStore:
                 """,
                 (
                     idempotency_key,
-                    json.dumps(result),
-                    now_iso,
+                    result_json,
+                    now,
                 ),
             )
 
+            if cursor.rowcount == 1:
+                return {
+                    "result": result,
+                    "duplicate": False,
+                }
+
+            row = connection.execute(
+                """
+                SELECT result
+                FROM idempotency_records
+                WHERE idempotency_key = ?
+                """,
+                (idempotency_key,),
+            ).fetchone()
+
             return {
-                "result": result,
-                "duplicate": False,
+                "result": json.loads(row["result"]),
+                "duplicate": True,
             }
 
     def count_idempotency_records(
